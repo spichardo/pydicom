@@ -182,8 +182,14 @@ def write_numbers(fp, data_element, struct_format):
             for val in value:
                 fp.write(pack(format_string, val))
     except Exception as e:
-        raise IOError("{0}\nfor data_element:\n{1}".format(str(e), str(data_element)))
-
+        #SP
+        print "{0}\nfor data_element:\n{1}".format(str(e), str(data_element))
+        print "{0}".format(str(value))
+        if 'Status' not in str(data_element):
+            raise IOError("{0}\nfor data_element:\n{1}".format(str(e), str(data_element)))
+        else:
+            value=1
+            fp.write(pack(format_string, value))
 
 def write_OBvalue(fp, data_element):
     """Write a data_element with VR of 'other byte' (OB)."""
