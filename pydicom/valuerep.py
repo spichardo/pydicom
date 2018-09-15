@@ -1,47 +1,51 @@
-# valuerep.py
+# Copyright 2008-2018 pydicom authors. See LICENSE file for details.
 """Special classes for DICOM value representations (VR)"""
-# Copyright (c) 2008-2012 Darcy Mason
-# This file is part of pydicom, released under a modified MIT license.
-#    See the file license.txt included with this distribution, also
-#    available at https://github.com/darcymason/pydicom
 
+from copy import deepcopy
 from decimal import Decimal
-
-from pydicom import config  # don't import datetime_conversion directly
-from pydicom import compat
-from pydicom.multival import MultiValue
-
-from datetime import date, datetime, time
-
-have_dateutil = True
-try:
-    from dateutil.tz import tzoffset
-except ImportError:
-    have_dateutil = False
-
 import re
 
-default_encoding = "iso8859"  # can't import from charset or get circular import
+from datetime import (date, datetime, time, timedelta)
 
-# For reading/writing data elements, these ones have longer explicit VR format
+# don't import datetime_conversion directly
+from pydicom import config
+from pydicom import compat
+from pydicom.multival import MultiValue
+from pydicom.util.fixes import timezone
+
+# can't import from charset or get circular import
+default_encoding = "iso8859"
+
+# For reading/writing data elements,
+# these ones have longer explicit VR format
 # Taken from PS3.5 Section 7.1.2
-extra_length_VRs = ('OB', 'OD', 'OF', 'OL', 'OW', 'SQ', 'UC', 'UN',
-                    'UR', 'UT')
+extra_length_VRs = ('OB', 'OD', 'OF', 'OL', 'OW', 'SQ', 'UC', 'UN', 'UR', 'UT')
 
-# VRs that can be affected by character repertoire in (0008,0005) Specific Character Set
+# VRs that can be affected by character repertoire
+# in (0008,0005) Specific Character Set
 # See PS-3.5 (2011), section 6.1.2 Graphic Characters
-text_VRs = ('SH', 'LO', 'ST', 'LT',  'UC', 'UR', 'UT')  # and PN, but it is handled separately.
+# and PN, but it is handled separately.
+text_VRs = ('SH', 'LO', 'ST', 'LT', 'UC', 'UT')
+
+# Delimiters for text strings and person name that reset the encoding.
+# See PS3.5, Section 6.1.2.5.3
+# Note: We use characters for Python 2 and character codes for Python 3
+# because these are the types yielded if iterating over a byte string.
+
+# Characters/Character codes for text VR delimiters: LF, CR, TAB, FF
+TEXT_VR_DELIMS = ({'\n', '\r', '\t', '\f'} if compat.in_py2
+                  else {0x0d, 0x0a, 0x09, 0x0c})
+
+# Character/Character code for PN delimiter: name part separator '^'
+# (the component separator '=' is handled separately)
+PN_DELIMS = {'^'} if compat.in_py2 else {0xe5}
 
 match_string = b''.join([
-    b'(?P<single_byte>',
-    b'(?P<family_name>[^=\^]*)',
-    b'\^?(?P<given_name>[^=\^]*)',
-    b'\^?(?P<middle_name>[^=\^]*)',
-    b'\^?(?P<name_prefix>[^=\^]*)',
-    b'\^?(?P<name_suffix>[^=\^]*)',
-    b')',
-    b'=?(?P<ideographic>[^=]*)',
-    b'=?(?P<phonetic>[^=]*)$'])
+    b'(?P<single_byte>', br'(?P<family_name>[^=\^]*)',
+    br'\^?(?P<given_name>[^=\^]*)', br'\^?(?P<middle_name>[^=\^]*)',
+    br'\^?(?P<name_prefix>[^=\^]*)', br'\^?(?P<name_suffix>[^=\^]*)', b')',
+    b'=?(?P<ideographic>[^=]*)', b'=?(?P<phonetic>[^=]*)$'
+])
 
 match_string_uni = re.compile(match_string.decode('iso8859'))
 match_string_bytes = re.compile(match_string)
@@ -56,17 +60,17 @@ class DA(date):
     __slots__ = ['original_string']
 
     def __getstate__(self):
-        return dict(
-            (slot, getattr(self, slot))
-            for slot in self.__slots__
-            if hasattr(self, slot)
-        )
+        return dict((slot, getattr(self, slot)) for slot in self.__slots__
+                    if hasattr(self, slot))
 
     def __setstate__(self, state):
         for slot, value in state.items():
             setattr(self, slot, value)
 
     def __reduce__(self):
+        return super(DA, self).__reduce__() + (self.__getstate__(),)
+
+    def __reduce_ex__(self, protocol):
         return super(DA, self).__reduce__() + (self.__getstate__(),)
 
     def __new__(cls, val):
@@ -97,7 +101,8 @@ class DA(date):
                 try:
                     val = super(DA, cls).__new__(cls, val)
                 except TypeError:
-                    raise ValueError("Cannot convert to datetime: '" + val + "'")
+                    raise ValueError("Cannot convert to datetime: '%s'" %
+                                     (val))
         elif isinstance(val, date):
             val = super(DA, cls).__new__(cls, val.year, val.month, val.day)
         else:
@@ -116,6 +121,9 @@ class DA(date):
         else:
             return super(DA, self).__str__()
 
+    def __repr__(self):
+        return "\"" + str(self) + "\""
+
 
 class DT(datetime):
     """Store value for DICOM VR DT (DateTime) as datetime.datetime.
@@ -127,11 +135,8 @@ class DT(datetime):
     _regex_dt = re.compile(r"((\d{4,14})(\.(\d{1,6}))?)([+-]\d{4})?")
 
     def __getstate__(self):
-        return dict(
-            (slot, getattr(self, slot))
-            for slot in self.__slots__
-            if hasattr(self, slot)
-        )
+        return dict((slot, getattr(self, slot)) for slot in self.__slots__
+                    if hasattr(self, slot))
 
     def __setstate__(self, state):
         for slot, value in state.items():
@@ -139,6 +144,13 @@ class DT(datetime):
 
     def __reduce__(self):
         return super(DT, self).__reduce__() + (self.__getstate__(),)
+
+    def __reduce_ex__(self, protocol):
+        return super(DT, self).__reduce__() + (self.__getstate__(),)
+
+    @staticmethod
+    def _utc_offset(offset, name):
+        return timezone(timedelta(seconds=offset), name)
 
     def __new__(cls, val):
         """Create an instance of DT object.
@@ -182,24 +194,23 @@ class DT(datetime):
                         microsecond = 0
                 tz_match = match.group(5)
                 if tz_match:
-                    offset = (int(tz_match[1:3]) * 60 + int(tz_match[3:5])) * 60
+                    offset1 = int(tz_match[1:3]) * 60
+                    offset2 = int(tz_match[3:5])
+                    offset = (offset1 + offset2) * 60
                     if tz_match[0] == '-':
                         offset = -offset
-                    if not have_dateutil:
-                        msg = "The python-dateutil package is required to convert dates/times to datetime objects"
-                        msg += "\nPlease install python-dateutil or set pydicom.config.datetime_conversion = False"
-                        raise ImportError(msg)
-                    tzinfo = tzoffset(tz_match, offset)
+                    tzinfo = cls._utc_offset(offset, tz_match)
                 else:
                     tzinfo = None
-                val = super(DT, cls).__new__(cls, year, month, day,
-                                             hour, minute, second,
-                                             microsecond, tzinfo)
+                val = super(DT,
+                            cls).__new__(cls, year, month, day, hour, minute,
+                                         second, microsecond, tzinfo)
             else:
                 try:
                     val = super(DT, cls).__new__(cls, val)
                 except TypeError:
-                    raise ValueError("Cannot convert to datetime: '" + val + "'")
+                    raise ValueError("Cannot convert to datetime: '%s'" %
+                                     (val))
         elif isinstance(val, datetime):
             val = super(DT, cls).__new__(cls, val.year, val.month, val.day,
                                          val.hour, val.minute, val.second,
@@ -220,6 +231,9 @@ class DT(datetime):
         else:
             return super(DT, self).__str__()
 
+    def __repr__(self):
+        return "\"" + str(self) + "\""
+
 
 class TM(time):
     """Store value for DICOM VR of TM (Time) as datetime.time.
@@ -231,17 +245,17 @@ class TM(time):
     _regex_tm = re.compile(r"(\d{2,6})(\.(\d{1,6}))?")
 
     def __getstate__(self):
-        return dict(
-            (slot, getattr(self, slot))
-            for slot in self.__slots__
-            if hasattr(self, slot)
-        )
+        return dict((slot, getattr(self, slot)) for slot in self.__slots__
+                    if hasattr(self, slot))
 
     def __setstate__(self, state):
         for slot, value in state.items():
             setattr(self, slot, value)
 
     def __reduce__(self):
+        return super(TM, self).__reduce__() + (self.__getstate__(),)
+
+    def __reduce_ex__(self, protocol):
         return super(TM, self).__reduce__() + (self.__getstate__(),)
 
     def __new__(cls, val):
@@ -280,7 +294,7 @@ class TM(time):
                 try:
                     val = super(TM, cls).__new__(cls, val)
                 except TypeError:
-                    raise ValueError("Cannot convert to datetime: '" + val + "'")
+                    raise ValueError("Cannot convert to datetime: '%s" % (val))
         elif isinstance(val, time):
             val = super(TM, cls).__new__(cls, val.hour, val.minute, val.second,
                                          val.microsecond)
@@ -300,6 +314,9 @@ class TM(time):
         else:
             return super(TM, self).__str__()
 
+    def __repr__(self):
+        return "\"" + str(self) + "\""
+
 
 class DSfloat(float):
     """Store values for DICOM VR of DS (Decimal String) as a float.
@@ -311,11 +328,8 @@ class DSfloat(float):
     __slots__ = ['original_string']
 
     def __getstate__(self):
-        return dict(
-            (slot, getattr(self, slot))
-            for slot in self.__slots__
-            if hasattr(self, slot)
-        )
+        return dict((slot, getattr(self, slot)) for slot in self.__slots__
+                    if hasattr(self, slot))
 
     def __setstate__(self, state):
         for slot, value in state.items():
@@ -328,9 +342,10 @@ class DSfloat(float):
         # ... also if user changes a data element value, then will get
         # a different object, because float is immutable.
 
+        has_attribute = hasattr(val, 'original_string')
         if isinstance(val, (str, compat.text_type)):
             self.original_string = val
-        elif isinstance(val, (DSfloat, DSdecimal)) and hasattr(val, 'original_string'):
+        elif isinstance(val, (DSfloat, DSdecimal)) and has_attribute:
             self.original_string = val.original_string
 
     def __str__(self):
@@ -351,11 +366,8 @@ class DSdecimal(Decimal):
     __slots__ = ['original_string']
 
     def __getstate__(self):
-        return dict(
-            (slot, getattr(self, slot))
-            for slot in self.__slots__
-            if hasattr(self, slot)
-        )
+        return dict((slot, getattr(self, slot)) for slot in self.__slots__
+                    if hasattr(self, slot))
 
     def __setstate__(self, state):
         for slot, value in state.items():
@@ -372,7 +384,8 @@ class DSdecimal(Decimal):
         # string but decimal.Decimal transforms it to an invalid string it will
         # still be initialized properly
         enforce_length = config.enforce_valid_values
-        # DICOM allows spaces around the string, but python doesn't, so clean it
+        # DICOM allows spaces around the string,
+        # but python doesn't, so clean it
         if isinstance(val, (str, compat.text_type)):
             val = val.strip()
             # If the input string is actually invalid that we relax the valid
@@ -382,18 +395,20 @@ class DSdecimal(Decimal):
         if val == '':
             return val
         if isinstance(val, float) and not config.allow_DS_float:
-            msg = ("DS cannot be instantiated with a float value, unless "
-                   "config.allow_DS_float is set to True. It is recommended to "
-                   "convert to a string instead, with the desired number of digits, "
-                   "or use Decimal.quantize and pass a Decimal instance.")
+            msg = ("DS cannot be instantiated with a float value, "
+                   "unless config.allow_DS_float is set to True. "
+                   "It is recommended to convert to a string instead, "
+                   "with the desired number of digits, or use "
+                   "Decimal.quantize and pass a Decimal instance.")
             raise TypeError(msg)
         if not isinstance(val, Decimal):
             val = super(DSdecimal, cls).__new__(cls, val)
         if len(str(val)) > 16 and enforce_length:
-            msg = ("DS value representation must be <= 16 characters by DICOM "
-                   "standard. Initialize with a smaller string, or set config.enforce_valid_values "
-                   "to False to override, "
-                   "or use Decimal.quantize() and initialize with a Decimal instance.")
+            msg = ("DS value representation must be <= 16 "
+                   "characters by DICOM standard. Initialize with "
+                   "a smaller string, or set config.enforce_valid_values "
+                   "to False to override, or use Decimal.quantize() and "
+                   "initialize with a Decimal instance.")
             raise OverflowError(msg)
         return val
 
@@ -406,17 +421,18 @@ class DSdecimal(Decimal):
         # a different Decimal, as Decimal is immutable.
         if isinstance(val, (str, compat.text_type)):
             self.original_string = val
-        elif isinstance(val, (DSfloat, DSdecimal)) and hasattr(val, 'original_string'):
+        elif isinstance(val, (DSfloat, DSdecimal)) and hasattr(val, 'original_string'):  # noqa
             self.original_string = val.original_string
 
     def __str__(self):
-        if hasattr(self, 'original_string') and len(self.original_string) <= 16:
+        if hasattr(self, 'original_string') and len(self.original_string) <= 16:  # noqa
             return self.original_string
         else:
             return super(DSdecimal, self).__str__()
 
     def __repr__(self):
         return "\"" + str(self) + "\""
+
 
 # CHOOSE TYPE OF DS
 if config.use_DS_decimal:
@@ -427,11 +443,13 @@ else:
 
 def DS(val):
     """Factory function for creating DS class instances.
-    Checks for blank string; if so, return that. Else calls DSfloat or DSdecimal
-    to create the class instance. This avoids overriding __new__ in DSfloat
+    Checks for blank string; if so, return that.
+    Else calls DSfloat or DSdecimal to create the class
+    instance. This avoids overriding __new__ in DSfloat
     (which carries a time penalty for large arrays of DS).
-    Similarly the string clean and check can be avoided and DSfloat called
-    directly if a string has already been processed.
+    Similarly the string clean and check can be avoided
+    and DSfloat called directly if a string has already
+    been processed.
     """
     if isinstance(val, (str, compat.text_type)):
         val = val.strip()
@@ -441,20 +459,20 @@ def DS(val):
 
 
 class IS(int):
-    """Derived class of int. Stores original integer string for exact rewriting
+    """Derived class of int. Stores original integer
+    string for exact rewriting
     of the string originally read or stored.
     """
     if compat.in_py2:
         __slots__ = ['original_string']
-        # Unlikely that str(int) will not be the same as the original, but could happen
+
+        # Unlikely that str(int) will not be the
+        # same as the original, but could happen
         # with leading zeros.
 
         def __getstate__(self):
-            return dict(
-                (slot, getattr(self, slot))
-                for slot in self.__slots__
-                if hasattr(self, slot)
-            )
+            return dict((slot, getattr(self, slot)) for slot in self.__slots__
+                        if hasattr(self, slot))
 
         def __setstate__(self, state):
             for slot, value in state.items():
@@ -466,14 +484,23 @@ class IS(int):
             return ''
         if isinstance(val, (str, compat.text_type)) and val.strip() == '':
             return ''
-        newval = super(IS, cls).__new__(cls, val)
+        # Overflow error in Python 2 for integers too large
+        # while calling super(IS). Fall back on the regular int
+        # casting that will automatically convert the val to long
+        # if needed.
+        try:
+            newval = super(IS, cls).__new__(cls, val)
+        except OverflowError:
+            newval = int(val)
         # check if a float or Decimal passed in, then could have lost info,
         # and will raise error. E.g. IS(Decimal('1')) is ok, but not IS(1.23)
         if isinstance(val, (float, Decimal)) and newval != val:
             raise TypeError("Could not convert value to integer without loss")
         # Checks in case underlying int is >32 bits, DICOM does not allow this
-        if (newval < -2 ** 31 or newval >= 2 ** 31) and config.enforce_valid_values:
-            message = "Value exceeds DICOM limits of -2**31 to (2**31 - 1) for IS"
+        check_newval = (newval < -2 ** 31 or newval >= 2 ** 31)
+        if check_newval and config.enforce_valid_values:
+            dcm_limit = "-2**31 to (2**31 - 1) for IS"
+            message = "Value exceeds DICOM limits of %s" % (dcm_limit)
             raise OverflowError(message)
         return newval
 
@@ -486,7 +513,7 @@ class IS(int):
 
     def __repr__(self):
         if hasattr(self, 'original_string'):
-            return "'" + self.original_string + "'"
+            return "\"" + self.original_string + "\""
         else:
             return "\"" + int.__str__(self) + "\""
 
@@ -495,10 +522,12 @@ def MultiString(val, valtype=str):
     """Split a bytestring by delimiters if there are any
 
     val -- DICOM bytestring to split up
-    valtype -- default str, but can be e.g. UID to overwrite to a specific type
+    valtype -- default str, but can be e.g.
+    UID to overwrite to a specific type
     """
     # Remove trailing blank used to pad to even length
-    # 2005.05.25: also check for trailing 0, error made in PET files we are converting
+    # 2005.05.25: also check for trailing 0, error made
+    # in PET files we are converting
 
     if val and (val.endswith(' ') or val.endswith('\x00')):
         val = val[:-1]
@@ -511,14 +540,53 @@ def MultiString(val, valtype=str):
         return MultiValue(valtype, splitup)
 
 
+def _verify_encodings(encodings):
+    """Checks the encoding to ensure proper format"""
+    if encodings is not None and not isinstance(encodings, list):
+        return [encodings]
+
+    return encodings
+
+
+def _decode_personname(components, encodings):
+    """Return a list of decoded person name components."""
+    from pydicom.charset import decode_string
+
+    if isinstance(components[0], compat.text_type):
+        comps = components
+    else:
+        comps = [decode_string(comp, encodings, PN_DELIMS)
+                 for comp in components]
+    # Remove empty elements from the end to avoid trailing '='
+    while len(comps) and not comps[-1]:
+        comps.pop()
+    return comps
+
+
+def _encode_personname(components, encodings):
+    if not compat.in_py2 and isinstance(components[0], bytes):
+        comps = components
+    else:
+        comps = [
+            C.encode(enc) for C, enc in zip(components, encodings)
+        ]
+
+    # Remove empty elements from the end
+    while len(comps) and not comps[-1]:
+        comps.pop()
+
+    return b'='.join(comps)
+
+
 class PersonName3(object):
-    def __init__(self, val, encodings=default_encoding):
+    def __init__(self, val, encodings=None):
         if isinstance(val, PersonName3):
+            encodings = val.encodings
             val = val.original_string
 
         self.original_string = val
 
-        self.encodings = self._verify_encodings(encodings)
+        self.encodings = _verify_encodings(encodings) or [default_encoding]
         self.parse(val)
 
     def parse(self, val):
@@ -546,39 +614,21 @@ class PersonName3(object):
     def __repr__(self):
         return self.original_string.__repr__()
 
-    # For python 3, any override of __cmp__ or __eq__ immutable requires
-    #   explicit redirect of hash function to the parent class
-    #   See http://docs.python.org/dev/3.0/reference/datamodel.html#object.__hash__
+    # For python 3, any override of __cmp__ or __eq__
+    # immutable requires explicit redirect of hash
+    # function to the parent class See
+    # See http://docs.python.org/
+    #  dev/3.0/reference/datamodel.html#object.__hash__
     __hash__ = object.__hash__
 
     def decode(self, encodings=None):
-        encodings = self._verify_encodings(encodings)
-
-        from pydicom.charset import clean_escseq
-        if not isinstance(self.components[0], bytes):
-            comps = self.components
-        else:
-            comps = [clean_escseq(comp.decode(enc), encodings)
-                     for comp, enc in zip(self.components, encodings)]
-
-        while len(comps) and not comps[-1]:
-            comps.pop()
-
-        return PersonName3('='.join(comps), encodings)
+        encodings = _verify_encodings(encodings) or self.encodings
+        comps = _decode_personname(self.components, encodings)
+        return PersonName3(u'='.join(comps), encodings)
 
     def encode(self, encodings=None):
-        encodings = self._verify_encodings(encodings)
-
-        if isinstance(self.components[0], bytes):
-            comps = self.components
-        else:
-            comps = [C.encode(enc) for C, enc in zip(self.components, encodings)]
-
-        # Remove empty elements from the end
-        while len(comps) and not comps[-1]:
-            comps.pop()
-
-        return b'='.join(comps)
+        encodings = _verify_encodings(encodings) or self.encodings
+        return _encode_personname(self.components, encodings)
 
     def family_comma_given(self):
         return self.formatted('%(family_name)s, %(given_name)s')
@@ -589,37 +639,31 @@ class PersonName3(object):
         else:
             return format_str % self.__dict__
 
-    def _verify_encodings(self, encodings):
-        if encodings is None:
-            return self.encodings
-
-        if not isinstance(encodings, list):
-            encodings = [encodings] * 3
-
-        if len(encodings) == 2:
-            encodings.append(encodings[1])
-
-        return encodings
-
 
 class PersonNameBase(object):
     """Base class for Person Name classes"""
 
     def __init__(self, val):
         """Initialize the PN properties"""
-        # Note normally use __new__ on subclassing an immutable, but here we just want
-        #    to do some pre-processing for properties
-        # PS 3.5-2008 section 6.2 (p.28)  and 6.2.1 describes PN. Briefly:
-        #  single-byte-characters=ideographic characters=phonetic-characters
+        # Note normally use __new__ on subclassing an immutable,
+        # but here we just want to do some pre-processing
+        # for properties PS 3.5-2008 section 6.2 (p.28)
+        # and 6.2.1 describes PN. Briefly:
+        # single-byte-characters=ideographic
+        # characters=phonetic-characters
         # (each with?):
-        #   family-name-complex^Given-name-complex^Middle-name^name-prefix^name-suffix
+        #   family-name-complex
+        #  ^Given-name-complex
+        #  ^Middle-name^name-prefix^name-suffix
         self.parse()
 
     def formatted(self, format_str):
         """Return a formatted string according to the format pattern
 
-        Use "...%(property)...%(property)..." where property is one of
-           family_name, given_name, middle_name, name_prefix, name_suffix
+        Use "...%(property)...%(property)..." where property
+        is one of family_name, given_name,
+                  middle_name, name_prefix,
+                  name_suffix
         """
         return format_str % self.__dict__
 
@@ -636,20 +680,22 @@ class PersonNameBase(object):
             self.phonetic = self.components[2]
 
         if self.single_byte:
-            name_string = self.single_byte + "^^^^"  # in case missing trailing items are left out
+            # in case missing trailing items are left out
+            name_string = self.single_byte + "^^^^"
             parts = name_string.split("^")[:5]
             self.family_name, self.given_name, self.middle_name = parts[:3]
             self.name_prefix, self.name_suffix = parts[3:]
         else:
             (self.family_name, self.given_name, self.middle_name,
-                self.name_prefix, self.name_suffix) = ('', '', '', '', '')
+             self.name_prefix, self.name_suffix) = ('', '', '', '', '')
 
 
 class PersonName(PersonNameBase, bytes):
     """Human-friendly class to hold VR of Person Name (PN)
 
     Name is parsed into the following properties:
-    single-byte, ideographic, and phonetic components (PS3.5-2008 6.2.1)
+    single-byte, ideographic, and phonetic components
+    (PS3.5-2008 6.2.1)
     family_name,
     given_name,
     middle_name,
@@ -657,6 +703,7 @@ class PersonName(PersonNameBase, bytes):
     name_suffix
 
     """
+
     def __new__(cls, val):
         """Return instance of the new class"""
         # Check if trying to convert a string that has already been converted
@@ -673,11 +720,12 @@ class PersonName(PersonNameBase, bytes):
     def family_comma_given(self):
         """Return name as 'Family-name, Given-name'"""
         return self.formatted("%(family_name)s, %(given_name)s")
+
     # def __str__(self):
-        # return str(self.byte_string)
-        # XXX need to process the ideographic or phonetic components?
+    # return str(self.byte_string)
+    # XXX need to process the ideographic or phonetic components?
     # def __len__(self):
-        # return len(self.byte_string)
+    # return len(self.byte_string)
 
 
 class PersonNameUnicode(PersonNameBase, compat.text_type):
@@ -690,54 +738,42 @@ class PersonNameUnicode(PersonNameBase, compat.text_type):
                  from pydicom.charset.python_encodings mapping
                  of values in DICOM data element (0008,0005).
         """
-        from pydicom.charset import clean_escseq  # in here to avoid circular import
-
-        # Make the possible three character encodings explicit:
-        if not isinstance(encodings, list):
-            encodings = [encodings] * 3
-        if len(encodings) == 2:
-            encodings.append(encodings[1])
-        components = val.split(b"=")
-        # Remove the first encoding if only one component is present
-        if (len(components) == 1):
-            del encodings[0]
-
-        comps = [clean_escseq(C.decode(enc), encodings)
-                 for C, enc in zip(components, encodings)]
+        encodings = _verify_encodings(encodings)
+        comps = _decode_personname(val.split(b"="), encodings)
         new_val = u"=".join(comps)
 
         return compat.text_type.__new__(cls, new_val)
 
     def __init__(self, val, encodings):
-        self.encodings = self._verify_encodings(encodings)
+        self.encodings = _verify_encodings(encodings)
         PersonNameBase.__init__(self, val)
 
-    def _verify_encodings(self, encodings):
-        """Checks the encoding to ensure proper format"""
-        if encodings is None:
-            return self.encodings
+    def __copy__(self):
+        """Correctly copy object.
+        Needed because of the overwritten __new__.
+        """
+        # no need to use the original encoding here - we just encode and
+        # decode in utf-8 and set the original encoding later
+        name = compat.text_type(self).encode('utf8')
+        new_person = PersonNameUnicode(name, 'utf8')
+        new_person.__dict__.update(self.__dict__)
+        return new_person
 
-        if not isinstance(encodings, list):
-            encodings = [encodings] * 3
-
-        if len(encodings) == 2:
-            encodings.append(encodings[1])
-
-        return encodings
+    def __deepcopy__(self, memo):
+        """Make correctly a deep copy of the object.
+        Needed because of the overwritten __new__.
+        """
+        name = compat.text_type(self).encode('utf8')
+        new_person = PersonNameUnicode(name, 'utf8')
+        memo[id(self)] = new_person
+        for k, v in self.__dict__.items():
+            setattr(new_person, k, deepcopy(v, memo))
+        return new_person
 
     def encode(self, encodings):
         """Encode the unicode using the specified encoding"""
-        encodings = self._verify_encodings(encodings)
-
-        components = self.split('=')
-
-        comps = [C.encode(enc) for C, enc in zip(components, encodings)]
-
-        # Remove empty elements from the end
-        while len(comps) and not comps[-1]:
-            comps.pop()
-
-        return '='.join(comps)
+        encodings = _verify_encodings(encodings) or self.encodings
+        return _encode_personname(self.split('='), encodings)
 
     def family_comma_given(self):
         """Return name as 'Family-name, Given-name'"""
