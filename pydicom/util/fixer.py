@@ -1,10 +1,6 @@
-# fixer.py
+# Copyright 2008-2018 pydicom authors. See LICENSE file for details.
 """Code to fix non-standard dicom issues in files
 """
-# Copyright (c) 2008-2014 Darcy Mason
-# This file is part of pydicom, released under a modified MIT license.
-#    See the file license.txt included with this distribution, also
-#    available at https://github.com/darcymason/pydicom
 
 from pydicom import config
 from pydicom import datadict
@@ -38,7 +34,8 @@ def fix_separator_callback(raw_elem, **kwargs):
     return return_val
 
 
-def fix_separator(invalid_separator, for_VRs=["DS", "IS"],
+def fix_separator(invalid_separator,
+                  for_VRs=["DS", "IS"],
                   process_unknown_VRs=True):
     """A callback function to fix RawDataElement values using
     some other separator than the dicom standard backslash character
